@@ -1,4 +1,4 @@
-use ahash::{AHashMap as Map, AHashSet as Set, RandomState};
+use ahash::{AHashMap as Map, RandomState};
 use memmap2::{Mmap, MmapOptions};
 use parquet::{
     data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type},
@@ -11,7 +11,10 @@ use std::{
     fs::{self, File},
     hash::{BuildHasherDefault, Hash, Hasher},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Instant,
 };
 
@@ -280,7 +283,6 @@ type Raw<'a> = (EventKey<'a>, Candidate);
 
 struct Parsed<'a> {
     shards: Vec<Vec<Raw<'a>>>,
-    users: Vec<Bytes<'a>>,
 }
 #[derive(Clone, Copy)]
 struct Event {
@@ -304,28 +306,47 @@ struct ClickInput<'a> {
     campaign: u32,
 }
 
+struct UnknownUsers<'a> {
+    shards: Vec<Mutex<HashMap<EventKey<'a>, u32, BuildHasherDefault<CachedHasher>>>>,
+    next: AtomicU32,
+    hash: RandomState,
+}
+impl<'a> UnknownUsers<'a> {
+    fn new(first: u32) -> Self {
+        Self {
+            shards: (0..256).map(|_| Mutex::new(HashMap::default())).collect(),
+            next: AtomicU32::new(first),
+            hash: RandomState::with_seeds(5, 7, 11, 13),
+        }
+    }
+    fn intern(&self, id: Bytes<'a>) -> u32 {
+        let hash = self.hash.hash_one(id);
+        let key = EventKey { hash, bytes: id };
+        let mut shard = self.shards[hash as usize & 255].lock().unwrap();
+        *shard
+            .entry(key)
+            .or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed))
+    }
+    fn finish(self, names: &mut Vec<Bytes<'a>>) {
+        names.resize(self.next.into_inner() as usize, b"");
+        for shard in self.shards {
+            for (key, id) in shard.into_inner().unwrap() {
+                names[id as usize] = key.bytes;
+            }
+        }
+    }
+}
+
 fn intern_local<'a>(
     id: Bytes<'a>,
     known: &Map<Bytes<'a>, u32>,
     local: &mut Map<Bytes<'a>, u32>,
-    names: &mut Vec<Bytes<'a>>,
-    base: u32,
+    unknown: &UnknownUsers<'a>,
 ) -> u32 {
     if let Some(&user) = known.get(id) {
         return user;
     }
-    *local.entry(id).or_insert_with(|| {
-        let user = base + names.len() as u32;
-        names.push(id);
-        user
-    })
-}
-fn remap(user: u32, base: u32, missing: &[u32]) -> u32 {
-    if user < base {
-        user
-    } else {
-        missing[(user - base) as usize]
-    }
+    *local.entry(id).or_insert_with(|| unknown.intern(id))
 }
 #[derive(Default, Clone, Copy)]
 struct Metrics {
@@ -574,6 +595,7 @@ fn main() {
     }
     users.finish();
     let known_count = users.names.len() as u32;
+    let unknown_users = UnknownUsers::new(known_count);
     eprintln!("dimensions+links {:.3}s", clock.elapsed().as_secs_f64());
     profile.mark("dimensions_links");
     let event_files: Vec<_> = csv_files(&data.join("events"))
@@ -591,12 +613,11 @@ fn main() {
         .div_ceil(8 * 1024 * 1024)
         .next_power_of_two()
         .clamp(64, 8192);
-    let mut parsed: Vec<Parsed> = chunks(&event_files)
+    let parsed: Vec<Parsed> = chunks(&event_files)
         .into_par_iter()
         .map(|chunk| {
             let job = profile.start_job();
             let mut shards: Vec<Vec<Raw>> = (0..shard_count).map(|_| Vec::new()).collect();
-            let mut names = Vec::new();
             let mut local = Map::new();
             for row in lines(chunk) {
                 let Some(f) = fields::<7>(row) else {
@@ -633,7 +654,7 @@ fn main() {
                 })();
                 let (ts, revenue, category) = valid.unwrap_or((i64::MIN, 0, unknown));
                 let user = if valid.is_some() {
-                    intern_local(f[1], &users.ids, &mut local, &mut names, known_count)
+                    intern_local(f[1], &users.ids, &mut local, &unknown_users)
                 } else {
                     0
                 };
@@ -652,10 +673,7 @@ fn main() {
                     },
                 ));
             }
-            let result = Parsed {
-                shards,
-                users: names,
-            };
+            let result = Parsed { shards };
             profile.finish_job(job, chunk.len());
             result
         })
@@ -663,11 +681,10 @@ fn main() {
     eprintln!("parse events {:.3}s", clock.elapsed().as_secs_f64());
     profile.report_parse();
     profile.mark("event_parse");
-    let parsed_clicks: Vec<(Vec<ClickInput>, Vec<&[u8]>)> = chunks(&click_files)
+    let parsed_clicks: Vec<Vec<ClickInput>> = chunks(&click_files)
         .into_par_iter()
         .map(|chunk| {
             let mut list = Vec::new();
-            let mut ids = Vec::new();
             let mut local = Map::new();
             for row in lines(chunk) {
                 let Some(f) = fields::<4>(row) else {
@@ -688,45 +705,16 @@ fn main() {
                 list.push(ClickInput {
                     ts,
                     id: f[0],
-                    user: intern_local(f[1], &users.ids, &mut local, &mut ids, known_count),
+                    user: intern_local(f[1], &users.ids, &mut local, &unknown_users),
                     campaign,
                 });
             }
-            (list, ids)
+            list
         })
         .collect();
     eprintln!("parse clicks {:.3}s", clock.elapsed().as_secs_f64());
     profile.mark("click_parse");
-    let missing = parsed
-        .par_iter()
-        .map(|p| p.users.iter().copied().collect::<Set<_>>())
-        .chain(
-            parsed_clicks
-                .par_iter()
-                .map(|(_, ids)| ids.iter().copied().collect::<Set<_>>()),
-        )
-        .reduce(Set::new, |mut a, mut b| {
-            if a.len() < b.len() {
-                std::mem::swap(&mut a, &mut b);
-            }
-            a.extend(b);
-            a
-        });
-    users.ids.reserve(missing.len());
-    for user in missing {
-        users.add(user);
-    }
-    users.finish();
-    parsed.par_iter_mut().for_each(|p| {
-        let mapping: Vec<u32> = p.users.iter().map(|id| users.ids[id]).collect();
-        for part in &mut p.shards {
-            for (_, candidate) in part {
-                if candidate.ts != i64::MIN {
-                    candidate.user = remap(candidate.user, known_count, &mapping);
-                }
-            }
-        }
-    });
+    unknown_users.finish(&mut users.names);
     eprintln!("intern users {:.3}s", clock.elapsed().as_secs_f64());
     profile.mark("missing_id_resolution");
     let mut raw_shards: Vec<Vec<Vec<Raw>>> = (0..shard_count).map(|_| Vec::new()).collect();
@@ -737,12 +725,11 @@ fn main() {
     }
     let mut clicks: Vec<Click> = parsed_clicks
         .into_par_iter()
-        .flat_map_iter(|(v, missing)| {
-            let mapping: Vec<u32> = missing.iter().map(|id| users.ids[id]).collect();
+        .flat_map_iter(|v| {
             v.into_iter().map(move |c| Click {
                 ts: c.ts,
                 id: c.id,
-                user: remap(c.user, known_count, &mapping),
+                user: c.user,
                 campaign: c.campaign,
             })
         })
@@ -909,6 +896,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_unknown_ids_get_one_stable_name_each() {
+        let unknown = UnknownUsers::new(1);
+        let ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|worker| {
+                    let unknown = &unknown;
+                    scope.spawn(move || {
+                        let name: &[u8] = match worker % 3 {
+                            0 => b"u1",
+                            1 => b" u1",
+                            _ => b"U1",
+                        };
+                        let first = unknown.intern(name);
+                        for _ in 0..1000 {
+                            assert_eq!(unknown.intern(name), first);
+                        }
+                        (name, first)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for a in &ids {
+            for b in &ids {
+                assert_eq!(a.0 == b.0, a.1 == b.1);
+            }
+        }
+        let mut names = vec![b"linked".as_slice()];
+        unknown.finish(&mut names);
+        assert_eq!(names.len(), 4);
+        assert_eq!(names[0], b"linked");
+        for (name, id) in ids {
+            assert_eq!(names[id as usize], name);
+        }
+    }
 
     #[test]
     fn cached_hash_collisions_preserve_distinct_event_ids() {
