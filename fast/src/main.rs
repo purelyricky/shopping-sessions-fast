@@ -18,6 +18,8 @@ use std::{
     time::Instant,
 };
 
+#[path = "csv.rs"]
+mod csv;
 #[path = "person_sort.rs"]
 mod person_sort;
 
@@ -63,34 +65,9 @@ type Bytes<'a> = &'a [u8];
 
 // LF is the only record delimiter. All other bytes, including CR and spaces,
 // belong to fields. There are no quoted delimiters in this specified dialect.
+#[inline(always)]
 fn fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
-    let mut result = [&[][..]; N];
-    let mut n = 0;
-    for mut value in memchr::memchr_iter(b',', row)
-        .map(|i| i + 1)
-        .chain(std::iter::once(row.len() + 1))
-        .scan(0, |start, end| {
-            let part = &row[*start..end - 1];
-            *start = end;
-            Some(part)
-        })
-    {
-        if n == N {
-            return None;
-        }
-        if value.first() == Some(&b'"') {
-            if value.len() < 2 || value.last() != Some(&b'"') {
-                return None;
-            }
-            value = &value[1..value.len() - 1];
-        }
-        if value.contains(&b'"') {
-            return None;
-        }
-        result[n] = value;
-        n += 1;
-    }
-    (n == N).then_some(result)
+    csv::fields(row)
 }
 
 fn number(s: &[u8]) -> Option<i64> {
@@ -298,10 +275,11 @@ impl<'a> Users<'a> {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Candidate {
-    user: u32,
     ingest: i64,
-    ts: i64,
+    user: u32,
+    ts: u32,
     revenue: u32,
     category: u32,
 }
@@ -587,6 +565,13 @@ fn main() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(8);
     let mut profile = profiling::Profiler::new(threads);
+    if std::env::var_os("PROFILE").is_some() {
+        eprintln!(
+            "PROFILE candidate_bytes={} raw_bytes={}",
+            std::mem::size_of::<Candidate>(),
+            std::mem::size_of::<Raw>()
+        );
+    }
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
@@ -684,7 +669,12 @@ fn main() {
                     };
                     Some((ts, revenue, category))
                 })();
-                let (ts, revenue, category) = valid.unwrap_or((i64::MIN, 0, unknown));
+                let (ts, revenue, category) = match valid {
+                    Some((ts, revenue, category)) => {
+                        ((ts - window_start) as u32, revenue, category)
+                    }
+                    None => (u32::MAX, 0, unknown),
+                };
                 let user = if valid.is_some() {
                     intern_local(f[1], &users, &mut local, &unknown_users)
                 } else {
@@ -792,11 +782,11 @@ fn main() {
             }
             let mut events = Vec::with_capacity(keep.len());
             for (_, candidate) in keep {
-                if candidate.ts == i64::MIN {
+                if candidate.ts == u32::MAX {
                     continue;
                 }
                 events.push(Event {
-                    ts: (candidate.ts - window_start) as u32,
+                    ts: candidate.ts,
                     revenue: candidate.revenue,
                     user: candidate.user,
                     category: candidate.category,
