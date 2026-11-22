@@ -9,7 +9,11 @@ fn partition<T: Send>(parts: Vec<Vec<T>>, user: impl Fn(&T) -> u32 + Sync + Send
     let routed: Vec<Vec<Vec<T>>> = parts
         .into_par_iter()
         .map(|part| {
-            let mut buckets: Vec<Vec<T>> = (0..BUCKETS).map(|_| Vec::new()).collect();
+            let mut counts = [0usize; BUCKETS];
+            for value in &part {
+                counts[user(value) as usize & (BUCKETS - 1)] += 1;
+            }
+            let mut buckets: Vec<Vec<T>> = counts.into_iter().map(Vec::with_capacity).collect();
             for value in part {
                 let at = user(&value) as usize & (BUCKETS - 1);
                 buckets[at].push(value);
@@ -17,7 +21,9 @@ fn partition<T: Send>(parts: Vec<Vec<T>>, user: impl Fn(&T) -> u32 + Sync + Send
             buckets
         })
         .collect();
-    let mut groups: Vec<Vec<Vec<T>>> = (0..BUCKETS).map(|_| Vec::new()).collect();
+    let mut groups: Vec<Vec<Vec<T>>> = (0..BUCKETS)
+        .map(|_| Vec::with_capacity(routed.len()))
+        .collect();
     for source in routed {
         for (group, part) in groups.iter_mut().zip(source) {
             group.push(part);
