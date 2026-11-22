@@ -153,6 +153,67 @@ fn timestamp(s: &[u8]) -> Option<i64> {
     Some(civil_days(y, m, d) * DAY + h * 3_600_000 + minute * 60_000 + sec * 1000 - offset)
 }
 
+// Decode the normal F1 ingest format directly, retaining full i64 timestamps.
+// Unexpected shapes or calendar values preserve the general parser's behavior.
+fn ingest_timestamp(s: &[u8]) -> i64 {
+    let Ok(s): Result<&[u8; 20], _> = s.try_into() else {
+        return timestamp(s).expect("ingest_ts is valid");
+    };
+    if !f1_shape(s) {
+        return timestamp(s).expect("ingest_ts is valid");
+    }
+    let pair = |at| i64::from(s[at]) * 10 + i64::from(s[at + 1]) - 528;
+    let year = pair(0) * 100 + pair(2);
+    let (month, day, hour, minute, second) = (pair(5), pair(8), pair(11), pair(14), pair(17));
+    let maxday = match month {
+        2 => 28 + i64::from(year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)),
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=maxday).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return timestamp(s).expect("ingest_ts is valid");
+    }
+    civil_days(year, month, day) * DAY + hour * 3_600_000 + minute * 60_000 + second * 1000
+}
+
+#[inline]
+fn f1_shape(s: &[u8; 20]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let prefix = unsafe {
+        use std::arch::x86_64::*;
+        // SSE2 is baseline on x86-64; the load is within this 20-byte array.
+        let input = _mm_loadu_si128(s.as_ptr().cast());
+        let low = _mm_setr_epi8(
+            48, 48, 48, 48, 45, 48, 48, 45, 48, 48, 84, 48, 48, 58, 48, 48,
+        );
+        let high = _mm_setr_epi8(
+            57, 57, 57, 57, 45, 57, 57, 45, 57, 57, 84, 57, 57, 58, 57, 57,
+        );
+        _mm_movemask_epi8(_mm_or_si128(
+            _mm_cmplt_epi8(input, low),
+            _mm_cmpgt_epi8(input, high),
+        )) == 0
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let prefix = s[4] == b'-'
+        && s[7] == b'-'
+        && s[10] == b'T'
+        && s[13] == b':'
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15]
+            .into_iter()
+            .all(|at| s[at].is_ascii_digit());
+    prefix
+        && s[16] == b':'
+        && s[19] == b'Z'
+        && s[17].wrapping_sub(b'0') <= 9
+        && s[18].wrapping_sub(b'0') <= 9
+}
+
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<_> = fs::read_dir(dir)
         .unwrap()
@@ -793,7 +854,7 @@ fn main() {
                 if f[0].is_empty() {
                     continue;
                 }
-                let ingest = timestamp(f[3]).expect("ingest_ts is valid F1");
+                let ingest = ingest_timestamp(f[3]);
                 // Cache validation, but retain invalid candidates for exact
                 // earliest-ingest dedup. An invalid winner is never rescued.
                 let valid = (|| {
@@ -1103,6 +1164,55 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guaranteed_f1_ingest_decoder_matches_full_calendar_parser() {
+        for value in [
+            b"0000-01-01T00:00:00Z",
+            b"0000-02-29T23:59:59Z",
+            b"1900-02-28T23:59:59Z",
+            b"1969-12-31T23:59:59Z",
+            b"1970-01-01T00:00:00Z",
+            b"2000-02-29T12:34:56Z",
+            b"2026-10-01T01:02:03Z",
+            b"2028-02-29T00:00:00Z",
+            b"9999-12-31T23:59:59Z",
+        ] {
+            assert_eq!(ingest_timestamp(value), timestamp(value).unwrap());
+        }
+        for value in [
+            b"1791071890000".as_slice(),
+            b"2026-10-01T01:02:03+01:00",
+            b"00000000000000000000",
+        ] {
+            assert_eq!(ingest_timestamp(value), timestamp(value).unwrap());
+        }
+    }
+
+    #[test]
+    fn f1_vector_shape_guard_matches_scalar_for_every_changed_byte() {
+        let pattern = b"0000-00-00T00:00:00Z";
+        for at in 0..20 {
+            for byte in 0..=255 {
+                let mut value = *b"2028-02-29T12:34:56Z";
+                value[at] = byte;
+                let expected = value.iter().zip(pattern).all(|(&byte, &pattern)| {
+                    if pattern == b'0' {
+                        byte.is_ascii_digit()
+                    } else {
+                        byte == pattern
+                    }
+                });
+                assert_eq!(f1_shape(&value), expected);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ingest_ts is valid")]
+    fn invalid_f1_calendar_keeps_general_parser_failure() {
+        ingest_timestamp(b"2026-02-30T00:00:00Z");
+    }
 
     #[test]
     fn batch_tag_collision_checks_raw_bytes_before_canonical_parent() {

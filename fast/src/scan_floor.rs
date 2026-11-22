@@ -3,15 +3,6 @@
 mod engine {
     include!("main.rs");
 
-    fn fast_ingest(s: &[u8]) -> i64 {
-        let s: &[u8; 20] = s.try_into().expect("ingest_ts is guaranteed valid F1");
-        let pair = |at| i64::from(s[at]) * 10 + i64::from(s[at + 1]) - 528;
-        let year = pair(0) * 100 + pair(2);
-        civil_days(year, pair(5), pair(8)) * DAY
-            + pair(11) * 3_600_000
-            + pair(14) * 60_000
-            + pair(17) * 1000
-    }
     struct BenchPart<'a> {
         rows: u64,
         checksum: u64,
@@ -119,7 +110,7 @@ mod engine {
                     }
                     let ingest = if LEVEL >= 3 {
                         if FAST {
-                            fast_ingest(f[3])
+                            ingest_timestamp(f[3])
                         } else {
                             timestamp(f[3]).unwrap()
                         }
