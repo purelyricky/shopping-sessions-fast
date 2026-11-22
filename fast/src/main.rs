@@ -22,6 +22,8 @@ use std::{
 mod csv;
 #[path = "person_sort.rs"]
 mod person_sort;
+#[path = "user_index.rs"]
+mod user_index;
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -201,7 +203,7 @@ fn chunks(maps: &[Mmap]) -> Vec<&[u8]> {
 }
 
 struct Users<'a> {
-    ids: Vec<HashMap<EventKey<'a>, u32, BuildHasherDefault<CachedHasher>>>,
+    ids: user_index::UserIndex,
     hash: RandomState,
     names: Vec<Bytes<'a>>,
     parent: Vec<u32>,
@@ -224,6 +226,11 @@ impl<'a> Users<'a> {
             .collect();
         let mut names = Vec::new();
         let (ids, hash) = interner.into_dicts(&mut names);
+        let ids = user_index::UserIndex::new(
+            names.len(),
+            ids.into_iter()
+                .flat_map(|shard| shard.into_iter().map(|(key, raw)| (key.hash, raw))),
+        );
         let parent = (0..names.len() as u32).collect();
         let mut users = Self {
             ids,
@@ -237,11 +244,16 @@ impl<'a> Users<'a> {
         users.finish();
         users
     }
+    #[cfg(any(test, feature = "bench"))]
     fn lookup(&self, id: Bytes<'_>) -> Option<u32> {
         let hash = self.hash.hash_one(id);
-        self.ids[hash as usize & 255]
-            .get(&EventKey { hash, bytes: id })
-            .copied()
+        self.lookup_hashed(id, hash)
+    }
+    #[inline]
+    fn lookup_hashed(&self, id: Bytes<'_>, hash: u64) -> Option<u32> {
+        self.ids
+            .find(hash, id, &self.names)
+            .map(|raw| self.parent[raw as usize])
     }
     fn root(&mut self, mut id: u32) -> u32 {
         while self.parent[id as usize] != id {
@@ -265,12 +277,6 @@ impl<'a> Users<'a> {
         for id in 0..self.parent.len() {
             self.parent[id] = self.root(id as u32);
         }
-        let parent = &self.parent;
-        self.ids.par_iter_mut().for_each(|shard| {
-            for id in shard.values_mut() {
-                *id = parent[*id as usize];
-            }
-        });
     }
 }
 
@@ -318,6 +324,7 @@ struct Click<'a> {
     user: u32,
     campaign: u32,
 }
+#[derive(Clone, Copy)]
 struct ClickInput<'a> {
     ts: i64,
     id: Bytes<'a>,
@@ -369,6 +376,7 @@ impl<'a> UnknownUsers<'a> {
     }
 }
 
+#[cfg(feature = "bench")]
 fn intern_local<'a>(
     id: Bytes<'a>,
     known: &Users<'a>,
@@ -379,6 +387,115 @@ fn intern_local<'a>(
         return user;
     }
     *local.entry(id).or_insert_with(|| unknown.intern(id))
+}
+
+#[derive(Clone, Copy)]
+struct PendingUser<'a> {
+    bytes: Bytes<'a>,
+    hash: u64,
+}
+impl<'a> PendingUser<'a> {
+    fn new(bytes: Bytes<'a>, known: &Users<'a>) -> Self {
+        let hash = if bytes.is_empty() {
+            0
+        } else {
+            let hash = known.hash.hash_one(bytes);
+            known.ids.prefetch_slot(hash);
+            hash
+        };
+        Self { bytes, hash }
+    }
+}
+
+// Slot hints are issued while parsing each line. Separate loops then overlap
+// the metadata and full-byte reads across the batch before exact probes.
+fn resolve_batch<'a, T>(
+    batch: &[T],
+    user: impl Fn(&T) -> PendingUser<'a>,
+    known: &Users<'a>,
+    local: &mut Map<Bytes<'a>, u32>,
+    unknown: &UnknownUsers<'a>,
+) -> [u32; 16] {
+    assert!(batch.len() <= 16);
+    let mut candidates = [None; 16];
+    for (row, candidate) in batch.iter().zip(&mut candidates) {
+        let user = user(row);
+        if !user.bytes.is_empty() {
+            *candidate = known.ids.candidate(user.hash);
+            if let Some(raw) = *candidate {
+                known.ids.prefetch_name(raw, &known.names, &known.parent);
+            }
+        }
+    }
+    for &candidate in &candidates[..batch.len()] {
+        if let Some(raw) = candidate {
+            known.ids.prefetch_bytes(raw, &known.names);
+        }
+    }
+    let mut resolved = [0; 16];
+    for ((row, output), candidate) in batch.iter().zip(&mut resolved).zip(candidates) {
+        let user = user(row);
+        if user.bytes.is_empty() {
+            continue;
+        }
+        let known_id = match candidate {
+            Some(raw) if known.names[raw as usize] == user.bytes => {
+                Some(known.parent[raw as usize])
+            }
+            // Tag collisions only select a prefetch candidate. A complete
+            // exact probe still checks later slots when these bytes differ.
+            Some(_) => known.lookup_hashed(user.bytes, user.hash),
+            None => None,
+        };
+        *output = known_id.unwrap_or_else(|| {
+            *local
+                .entry(user.bytes)
+                .or_insert_with(|| unknown.intern(user.bytes))
+        });
+    }
+    resolved
+}
+
+#[derive(Clone, Copy)]
+struct PendingEvent<'a> {
+    user: PendingUser<'a>,
+    key: EventKey<'a>,
+    value: Candidate,
+}
+fn flush_events<'a>(
+    batch: &[PendingEvent<'a>],
+    shards: &mut [Vec<Raw<'a>>],
+    known: &Users<'a>,
+    local: &mut Map<Bytes<'a>, u32>,
+    unknown: &UnknownUsers<'a>,
+) {
+    let resolved = resolve_batch(batch, |row| row.user, known, local, unknown);
+    let mask = shards.len() - 1;
+    for (row, &user) in batch.iter().zip(&resolved) {
+        let mut value = row.value;
+        value.user = user;
+        shards[row.key.hash as usize & mask].push((row.key, value));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingClick<'a> {
+    user: PendingUser<'a>,
+    value: ClickInput<'a>,
+}
+fn flush_clicks<'a>(
+    batch: &[PendingClick<'a>],
+    list: &mut Vec<ClickInput<'a>>,
+    known: &Users<'a>,
+    local: &mut Map<Bytes<'a>, u32>,
+    unknown: &UnknownUsers<'a>,
+) {
+    let resolved = resolve_batch(batch, |row| row.user, known, local, unknown);
+    for (row, &user) in batch.iter().zip(&resolved) {
+        let mut value = row.value;
+        value.user = user;
+        list.push(value);
+    }
 }
 #[derive(Default, Clone, Copy)]
 struct Metrics {
@@ -651,6 +768,24 @@ fn main() {
             let job = profile.start_job();
             let mut shards = raw_buffers(chunk, shard_count);
             let mut local = Map::new();
+            let mut batch = [PendingEvent {
+                user: PendingUser {
+                    bytes: b"",
+                    hash: 0,
+                },
+                key: EventKey {
+                    bytes: b"",
+                    hash: 0,
+                },
+                value: Candidate {
+                    ingest: 0,
+                    user: 0,
+                    ts: u32::MAX,
+                    revenue: 0,
+                    category: 0,
+                },
+            }; 16];
+            let mut batch_len = 0;
             for row in lines(chunk) {
                 let Some(f) = fields::<7>(row) else {
                     continue;
@@ -690,26 +825,35 @@ fn main() {
                     }
                     None => (u32::MAX, 0, unknown),
                 };
-                let user = if valid.is_some() {
-                    intern_local(f[1], &users, &mut local, &unknown_users)
-                } else {
-                    0
-                };
+                let user = PendingUser::new(if valid.is_some() { f[1] } else { b"" }, &users);
                 let event_hash = hash.hash_one(f[0]);
-                shards[(event_hash as usize) & (shard_count - 1)].push((
-                    EventKey {
+                batch[batch_len] = PendingEvent {
+                    user,
+                    key: EventKey {
                         hash: event_hash,
                         bytes: f[0],
                     },
-                    Candidate {
-                        user,
+                    value: Candidate {
+                        user: 0,
                         ingest,
                         ts,
                         revenue: revenue as u32,
                         category,
                     },
-                ));
+                };
+                batch_len += 1;
+                if batch_len == batch.len() {
+                    flush_events(&batch, &mut shards, &users, &mut local, &unknown_users);
+                    batch_len = 0;
+                }
             }
+            flush_events(
+                &batch[..batch_len],
+                &mut shards,
+                &users,
+                &mut local,
+                &unknown_users,
+            );
             let result = Parsed { shards };
             profile.finish_job(job, chunk.len());
             result
@@ -723,6 +867,19 @@ fn main() {
         .map(|chunk| {
             let mut list = Vec::new();
             let mut local = Map::new();
+            let mut batch = [PendingClick {
+                user: PendingUser {
+                    bytes: b"",
+                    hash: 0,
+                },
+                value: ClickInput {
+                    ts: 0,
+                    id: b"",
+                    user: 0,
+                    campaign: 0,
+                },
+            }; 16];
+            let mut batch_len = 0;
             for row in lines(chunk) {
                 let Some(f) = fields::<4>(row) else {
                     continue;
@@ -739,13 +896,28 @@ fn main() {
                 if ts < window_start - WEEK || ts >= window_end {
                     continue;
                 }
-                list.push(ClickInput {
-                    ts,
-                    id: f[0],
-                    user: intern_local(f[1], &users, &mut local, &unknown_users),
-                    campaign,
-                });
+                batch[batch_len] = PendingClick {
+                    user: PendingUser::new(f[1], &users),
+                    value: ClickInput {
+                        ts,
+                        id: f[0],
+                        user: 0,
+                        campaign,
+                    },
+                };
+                batch_len += 1;
+                if batch_len == batch.len() {
+                    flush_clicks(&batch, &mut list, &users, &mut local, &unknown_users);
+                    batch_len = 0;
+                }
             }
+            flush_clicks(
+                &batch[..batch_len],
+                &mut list,
+                &users,
+                &mut local,
+                &unknown_users,
+            );
             list
         })
         .collect();
@@ -933,6 +1105,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn batch_tag_collision_checks_raw_bytes_before_canonical_parent() {
+        let hash = u64::MAX;
+        let names: Vec<&[u8]> = vec![b"alias", b"a", b"other"];
+        let known = Users {
+            ids: user_index::UserIndex::new(3, (0..3).map(|raw| (hash, raw))),
+            hash: RandomState::with_seeds(5, 7, 11, 13),
+            names,
+            parent: vec![1, 1, 2],
+        };
+        let batch = [
+            PendingUser {
+                bytes: b"alias",
+                hash,
+            },
+            PendingUser {
+                bytes: b"other",
+                hash,
+            },
+            PendingUser {
+                bytes: b"missing",
+                hash,
+            },
+            PendingUser {
+                bytes: b"",
+                hash: 0,
+            },
+        ];
+        let unknown = UnknownUsers::new(3);
+        let mut local = Map::new();
+        let resolved = resolve_batch(&batch, |user| *user, &known, &mut local, &unknown);
+        assert_eq!(&resolved[..4], &[1, 2, 3, 0]);
+        assert_eq!(unknown.next.load(Ordering::Relaxed), 4);
+        assert_eq!(known.names[resolved[0] as usize], b"a");
+    }
+
+    #[test]
     fn opaque_id_lengths_survive_intern_and_frozen_lookup() {
         let storage: Vec<Vec<u8>> = [
             1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 127, 1024, 131072,
@@ -951,6 +1159,11 @@ mod tests {
         let mut names = Vec::new();
         let (ids, hash) = interner.into_dicts(&mut names);
         assert_eq!(names.len(), storage.len());
+        let ids = user_index::UserIndex::new(
+            names.len(),
+            ids.into_iter()
+                .flat_map(|shard| shard.into_iter().map(|(key, raw)| (key.hash, raw))),
+        );
         let known = Users {
             ids,
             hash,
