@@ -1,0 +1,22 @@
+
+## [2026-11-22T10:52:22+01:00] ACTION - Track scaffold created
+tool=claude-code
+model=claude-sonnet-5-5
+track=02-shopping-sessions
+files=AGENTS.md,CLAUDE.md,TASKS.md,DECISIONS.md,research.md,LICENSE
+
+Setup by claude-code in the orchestrator session: wrote shared protocol (adapted from the HackerRank Orchestrate log.txt idea), track facts from the official pages (read ~10:50 local) and the user's research extract, git init, MIT LICENSE. No code written yet. Browser extension was NOT connected in the setup session, so GitHub repo creation and leaderboard reading are still to do.
+
+## [2026-11-22T11:01:33+01:00] ACTION - Protocol rewritten for fully autonomous pairs
+tool=claude-code
+model=claude-sonnet-5-5
+track=shopping-sessions
+
+User changes: CAD De-ID dropped (storage); folders renamed without numbers; removed empty Downloads placeholder folders; agents now run unattended (lead=claude-code, builder=codex), create the GitHub repo themselves, push, submit and iterate. Added tools/wait_log.py. Docker Desktop is installed (needs a restart/PATH refresh).
+
+## [2026-11-22T11:43:58+01:00] SESSION
+tool=claude-code
+model=claude-sonnet-5-5
+track=shopping-sessions
+
+Lead session started 11:44 machine clock. Plan: fetch kit (rules.md, dev-answer, starters, generator), write spec checklist, build reference impl + diff harness, create GitHub repo, first submission.
