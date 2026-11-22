@@ -288,6 +288,21 @@ type Raw<'a> = (EventKey<'a>, Candidate);
 struct Parsed<'a> {
     shards: Vec<Vec<Raw<'a>>>,
 }
+fn raw_buffers<'a>(chunk: &[u8], shard_count: usize) -> Vec<Vec<Raw<'a>>> {
+    let rows = memchr::memchr_iter(b'\n', chunk).count() + 1;
+    let average = rows.div_ceil(shard_count);
+    // This is only an allocation hint. Normal Vec growth handles unusual
+    // row sizes and IDs that concentrate more candidates in one hash shard.
+    let capacity = if average >= 8 {
+        average + average.isqrt() * 3 + 8
+    } else {
+        0
+    };
+    (0..shard_count)
+        .map(|_| Vec::with_capacity(capacity))
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct Event {
     // Milliseconds from manifest.window_start (the generator window is 14 days).
@@ -634,7 +649,7 @@ fn main() {
         .into_par_iter()
         .map(|chunk| {
             let job = profile.start_job();
-            let mut shards: Vec<Vec<Raw>> = (0..shard_count).map(|_| Vec::new()).collect();
+            let mut shards = raw_buffers(chunk, shard_count);
             let mut local = Map::new();
             for row in lines(chunk) {
                 let Some(f) = fields::<7>(row) else {
@@ -916,6 +931,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_id_lengths_survive_intern_and_frozen_lookup() {
+        let storage: Vec<Vec<u8>> = [
+            1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 127, 1024, 131072,
+        ]
+        .into_iter()
+        .flat_map(|len| {
+            let mut first = vec![b'a'; len];
+            first[len / 2] = 0xc3;
+            let mut second = first.clone();
+            second[len / 2] = b'A';
+            [first, second]
+        })
+        .collect();
+        let interner = UnknownUsers::new(0);
+        let expected: Vec<_> = storage.iter().map(|name| interner.intern(name)).collect();
+        let mut names = Vec::new();
+        let (ids, hash) = interner.into_dicts(&mut names);
+        assert_eq!(names.len(), storage.len());
+        let known = Users {
+            ids,
+            hash,
+            parent: (0..names.len() as u32).collect(),
+            names,
+        };
+        for (name, id) in storage.iter().zip(expected) {
+            let separately_allocated = name.clone();
+            assert_eq!(known.lookup(&separately_allocated), Some(id));
+            assert_eq!(known.names[id as usize], name);
+        }
+    }
 
     #[test]
     fn concurrent_unknown_ids_get_one_stable_name_each() {

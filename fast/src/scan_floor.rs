@@ -46,7 +46,7 @@ mod engine {
                     rows: 0,
                     checksum: 0,
                     buffers: if LEVEL >= 7 {
-                        (0..shard_count).map(|_| Vec::new()).collect()
+                        raw_buffers(chunk, shard_count)
                     } else {
                         Vec::new()
                     },
