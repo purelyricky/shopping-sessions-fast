@@ -220,11 +220,14 @@ impl<'a> Users<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Raw<'a> {
-    id: Bytes<'a>,
-    row: Bytes<'a>,
+struct Candidate<'a> {
+    user: Bytes<'a>,
     ingest: i64,
+    ts: i64,
+    revenue: i64,
+    category: u32,
 }
+type Raw<'a> = (Bytes<'a>, Candidate<'a>);
 struct Parsed<'a> {
     shards: Vec<Vec<Raw<'a>>>,
     users: Set<Bytes<'a>>,
@@ -384,14 +387,14 @@ enum Col {
 fn str_col<'a>(values: impl Iterator<Item = Bytes<'a>>) -> Col {
     Col::Strings(values.map(ByteArray::from).collect())
 }
-fn write_table(path: &Path, schema: &str, columns: Vec<Col>) {
+fn write_table(path: &Path, filename: &str, schema: &str, columns: Vec<Col>) {
     fs::create_dir_all(path).unwrap();
     let props = WriterProperties::builder()
         .set_dictionary_enabled(false)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
         .build();
     let mut writer = SerializedFileWriter::new(
-        File::create(path.join("part-0.parquet")).unwrap(),
+        File::create(path.join(filename)).unwrap(),
         Arc::new(parse_message_type(schema).unwrap()),
         Arc::new(props),
     )
@@ -513,12 +516,43 @@ fn main() {
                     continue;
                 }
                 let ingest = timestamp(f[3]).expect("ingest_ts is valid F1");
-                p.shards[(hash.hash_one(f[0]) as usize) % SHARDS].push(Raw {
-                    id: f[0],
-                    row,
-                    ingest,
-                });
-                if !f[1].is_empty() && !users.ids.contains_key(f[1]) {
+                // Cache validation, but retain invalid candidates for exact
+                // earliest-ingest dedup. An invalid winner is never rescued.
+                let valid = (|| {
+                    if f[1].is_empty() || f[5].is_empty() {
+                        return None;
+                    }
+                    let ts = timestamp(f[2])?;
+                    if ts < window_start || ts >= window_end || ingest - ts > DAY {
+                        return None;
+                    }
+                    let revenue = match f[4] {
+                        b"view" | b"cart" => 0,
+                        b"purchase" => match number(f[6]) {
+                            Some(v) if (1..=10_000_000).contains(&v) => v,
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+                    let category = if revenue > 0 {
+                        products.get(f[5]).copied().unwrap_or(unknown)
+                    } else {
+                        unknown
+                    };
+                    Some((ts, revenue, category))
+                })();
+                let (ts, revenue, category) = valid.unwrap_or((i64::MIN, 0, unknown));
+                p.shards[(hash.hash_one(f[0]) as usize) % SHARDS].push((
+                    f[0],
+                    Candidate {
+                        user: f[1],
+                        ingest,
+                        ts,
+                        revenue,
+                        category,
+                    },
+                ));
+                if valid.is_some() && !users.ids.contains_key(f[1]) {
                     p.users.insert(f[1]);
                 }
             }
@@ -597,44 +631,24 @@ fn main() {
     let event_parts: Vec<Vec<Event>> = raw_shards
         .into_par_iter()
         .map(|raw| {
-            let mut keep: Map<&[u8], (&[u8], i64)> =
+            let mut keep: Map<&[u8], Candidate> =
                 Map::with_capacity(raw.iter().map(Vec::len).sum());
-            for Raw { id, row, ingest } in raw.into_iter().flatten() {
-                let entry = keep.entry(id).or_insert((row, ingest));
-                if ingest < entry.1 {
-                    *entry = (row, ingest);
+            for (id, candidate) in raw.into_iter().flatten() {
+                let entry = keep.entry(id).or_insert(candidate);
+                if candidate.ingest < entry.ingest {
+                    *entry = candidate;
                 }
             }
             let mut events = Vec::with_capacity(keep.len());
-            for (_, (row, ingest)) in keep {
-                let f = fields::<7>(row).unwrap();
-                if f[1].is_empty() || f[5].is_empty() {
+            for (_, candidate) in keep {
+                if candidate.ts == i64::MIN {
                     continue;
                 }
-                let Some(ts) = timestamp(f[2]) else {
-                    continue;
-                };
-                if ts < window_start || ts >= window_end || ingest - ts > DAY {
-                    continue;
-                }
-                let revenue = match f[4] {
-                    b"view" | b"cart" => 0,
-                    b"purchase" => match number(f[6]) {
-                        Some(v) if (1..=10_000_000).contains(&v) => v,
-                        _ => continue,
-                    },
-                    _ => continue,
-                };
-                let category = if revenue > 0 {
-                    products.get(f[5]).copied().unwrap_or(unknown)
-                } else {
-                    unknown
-                };
                 events.push(Event {
-                    ts,
-                    revenue,
-                    user: users.ids[f[1]],
-                    category,
+                    ts: candidate.ts,
+                    revenue: candidate.revenue,
+                    user: users.ids[candidate.user],
+                    category: candidate.category,
                 });
             }
             events
@@ -645,8 +659,8 @@ fn main() {
         events.append(&mut part);
     }
     let mut clicks: Vec<Click> = parsed_clicks
-        .into_iter()
-        .flat_map(|(v, _)| {
+        .into_par_iter()
+        .flat_map_iter(|(v, _)| {
             v.into_iter().map(|c| Click {
                 ts: c.ts,
                 id: c.id,
@@ -712,29 +726,37 @@ fn main() {
         }
     }
     let us = &results.users;
-    let mut cv = Vec::new();
-    let mut definitions = Vec::with_capacity(us.len());
-    for u in us {
-        definitions.push(i16::from(u.category.is_some()));
-        if let Some(c) = u.category {
-            cv.push(ByteArray::from(categories[c as usize]));
+    let parts: Vec<&[UserRow]> = if us.is_empty() {
+        vec![us]
+    } else {
+        us.chunks(131_072).collect()
+    };
+    parts.into_par_iter().enumerate().for_each(|(index, part)| {
+        let mut cv = Vec::new();
+        let mut definitions = Vec::with_capacity(part.len());
+        for u in part {
+            definitions.push(i16::from(u.category.is_some()));
+            if let Some(c) = u.category {
+                cv.push(ByteArray::from(categories[c as usize]));
+            }
         }
-    }
-    write_table(
-        &output.join("user_daily"),
+        write_table(
+        &output.join("user_daily"), &format!("part-{index:05}.parquet"),
         "message user_daily { REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BYTE_ARRAY top_category (UTF8); }",
         vec![
-            str_col(us.iter().map(|u| users.names[u.user as usize])),
-            Col::Dates(us.iter().map(|u| u.day).collect()),
-            Col::Ints(us.iter().map(|u| u.sessions).collect()),
-            Col::Ints(us.iter().map(|u| u.events).collect()),
-            Col::Ints(us.iter().map(|u| u.revenue).collect()),
+            str_col(part.iter().map(|u| users.names[u.user as usize])),
+            Col::Dates(part.iter().map(|u| u.day).collect()),
+            Col::Ints(part.iter().map(|u| u.sessions).collect()),
+            Col::Ints(part.iter().map(|u| u.events).collect()),
+            Col::Ints(part.iter().map(|u| u.revenue).collect()),
             Col::OptionalStrings(cv, definitions),
         ],
-    );
+        );
+    });
     let cs: Vec<_> = results.campaigns.into_iter().collect();
     write_table(
         &output.join("campaign_daily"),
+        "part-0.parquet",
         "message campaign_daily { REQUIRED BYTE_ARRAY campaign_id (UTF8); REQUIRED BYTE_ARRAY channel (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; REQUIRED INT64 revenue_cents; REQUIRED INT64 assisted_sessions; }",
         vec![
             str_col(cs.iter().map(|((c, _), _)| campaign_names[*c as usize])),
