@@ -7,15 +7,47 @@ use parquet::{
 };
 use rayon::prelude::*;
 use std::{
+    collections::HashMap,
     fs::{self, File},
+    hash::{BuildHasherDefault, Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
+#[derive(Clone, Copy)]
+struct EventKey<'a> {
+    hash: u64,
+    bytes: &'a [u8],
+}
+impl PartialEq for EventKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.bytes == other.bytes
+    }
+}
+impl Eq for EventKey<'_> {}
+impl Hash for EventKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+#[derive(Default)]
+struct CachedHasher(u64);
+impl Hasher for CachedHasher {
+    // Separate table bucket/fingerprint bits from the low shard-selection bits.
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(32)
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("EventKey writes one cached u64 hash");
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
-const SHARDS: usize = 64;
 type Bytes<'a> = &'a [u8];
 
 // LF is the only record delimiter. All other bytes, including CR and spaces,
@@ -54,14 +86,18 @@ fn number(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    let mut value = 0i64;
+    let s = &s[s.iter().position(|&c| c != b'0').unwrap_or(s.len())..];
+    if s.len() > 19 {
+        return None;
+    }
+    let mut value = 0u64;
     for &c in s {
         if !c.is_ascii_digit() {
             return None;
         }
-        value = value.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+        value = value * 10 + u64::from(c - b'0');
     }
-    Some(value)
+    i64::try_from(value).ok()
 }
 
 // Proleptic Gregorian calendar -> days since 1970-01-01.
@@ -142,7 +178,17 @@ fn map_file(path: &Path) -> Mmap {
     unsafe { MmapOptions::new().map(&file).unwrap() }
 }
 fn records(data: &[u8]) -> impl Iterator<Item = &[u8]> {
-    data.split(|&b| b == b'\n').skip(1)
+    lines(data).skip(1)
+}
+fn lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    memchr::memchr_iter(b'\n', data)
+        .map(|at| at + 1)
+        .chain(std::iter::once(data.len() + 1))
+        .scan(0, |start, end| {
+            let line = &data[*start..end - 1];
+            *start = end;
+            Some(line)
+        })
 }
 fn chunks(maps: &[Mmap]) -> Vec<&[u8]> {
     let mut jobs = Vec::new();
@@ -220,22 +266,24 @@ impl<'a> Users<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Candidate<'a> {
-    user: Bytes<'a>,
+struct Candidate {
+    user: u32,
     ingest: i64,
     ts: i64,
-    revenue: i64,
+    revenue: u32,
     category: u32,
 }
-type Raw<'a> = (Bytes<'a>, Candidate<'a>);
+type Raw<'a> = (EventKey<'a>, Candidate);
+
 struct Parsed<'a> {
     shards: Vec<Vec<Raw<'a>>>,
-    users: Set<Bytes<'a>>,
+    users: Vec<Bytes<'a>>,
 }
 #[derive(Clone, Copy)]
 struct Event {
-    ts: i64,
-    revenue: i64,
+    // Milliseconds from manifest.window_start (the generator window is 14 days).
+    ts: u32,
+    revenue: u32,
     user: u32,
     category: u32,
 }
@@ -249,8 +297,32 @@ struct Click<'a> {
 struct ClickInput<'a> {
     ts: i64,
     id: Bytes<'a>,
-    user: Bytes<'a>,
+    user: u32,
     campaign: u32,
+}
+
+fn intern_local<'a>(
+    id: Bytes<'a>,
+    known: &Map<Bytes<'a>, u32>,
+    local: &mut Map<Bytes<'a>, u32>,
+    names: &mut Vec<Bytes<'a>>,
+    base: u32,
+) -> u32 {
+    if let Some(&user) = known.get(id) {
+        return user;
+    }
+    *local.entry(id).or_insert_with(|| {
+        let user = base + names.len() as u32;
+        names.push(id);
+        user
+    })
+}
+fn remap(user: u32, base: u32, missing: &[u32]) -> u32 {
+    if user < base {
+        user
+    } else {
+        missing[(user - base) as usize]
+    }
 }
 #[derive(Default, Clone, Copy)]
 struct Metrics {
@@ -278,6 +350,7 @@ fn process_people(
     events: &[Event],
     clicks: &[Click],
     click_offsets: &[usize],
+    window_start: i64,
 ) -> Results {
     let mut result = Results::default();
     for &(begin, end) in spans {
@@ -308,7 +381,7 @@ fn process_people(
             };
         let mut at = begin;
         while at < end {
-            let start = events[at].ts;
+            let start = window_start + i64::from(events[at].ts);
             let session_day = start.div_euclid(DAY) as i32;
             if day != session_day {
                 push_daily(
@@ -332,8 +405,8 @@ fn process_people(
             let mut revenue = 0;
             for event in &events[at..stop] {
                 if event.revenue > 0 {
-                    revenue += event.revenue;
-                    *categories.entry(event.category).or_default() += event.revenue;
+                    revenue += i64::from(event.revenue);
+                    *categories.entry(event.category).or_default() += i64::from(event.revenue);
                 }
             }
             daily_sessions += 1;
@@ -457,6 +530,10 @@ fn main() {
         serde_json::from_slice(&fs::read(data.join("manifest.json")).unwrap()).unwrap();
     let window_start = timestamp(manifest["window_start"].as_str().unwrap().as_bytes()).unwrap();
     let window_end = timestamp(manifest["window_end"].as_str().unwrap().as_bytes()).unwrap();
+    assert!(
+        window_end > window_start && window_end - window_start <= i64::from(u32::MAX),
+        "window must fit relative milliseconds"
+    );
     let product_data = map_file(&data.join("products.csv"));
     let campaign_data = map_file(&data.join("campaigns.csv"));
     let mut categories: Vec<&[u8]> = records(&product_data)
@@ -491,6 +568,8 @@ fn main() {
             }
         }
     }
+    users.finish();
+    let known_count = users.names.len() as u32;
     eprintln!("dimensions+links {:.3}s", clock.elapsed().as_secs_f64());
     let event_files: Vec<_> = csv_files(&data.join("events"))
         .iter()
@@ -501,14 +580,19 @@ fn main() {
         .map(|p| map_file(p))
         .collect();
     let hash = RandomState::with_seeds(123, 456, 789, 987);
+    // Keep the dedup working set near cache size as input volume changes.
+    let event_bytes: usize = event_files.iter().map(|file| file.len()).sum();
+    let shard_count = event_bytes
+        .div_ceil(8 * 1024 * 1024)
+        .next_power_of_two()
+        .clamp(64, 8192);
     let mut parsed: Vec<Parsed> = chunks(&event_files)
         .into_par_iter()
         .map(|chunk| {
-            let mut p = Parsed {
-                shards: (0..SHARDS).map(|_| Vec::new()).collect(),
-                users: Set::new(),
-            };
-            for row in chunk.split(|&b| b == b'\n') {
+            let mut shards: Vec<Vec<Raw>> = (0..shard_count).map(|_| Vec::new()).collect();
+            let mut names = Vec::new();
+            let mut local = Map::new();
+            for row in lines(chunk) {
                 let Some(f) = fields::<7>(row) else {
                     continue;
                 };
@@ -542,30 +626,40 @@ fn main() {
                     Some((ts, revenue, category))
                 })();
                 let (ts, revenue, category) = valid.unwrap_or((i64::MIN, 0, unknown));
-                p.shards[(hash.hash_one(f[0]) as usize) % SHARDS].push((
-                    f[0],
+                let user = if valid.is_some() {
+                    intern_local(f[1], &users.ids, &mut local, &mut names, known_count)
+                } else {
+                    0
+                };
+                let event_hash = hash.hash_one(f[0]);
+                shards[(event_hash as usize) & (shard_count - 1)].push((
+                    EventKey {
+                        hash: event_hash,
+                        bytes: f[0],
+                    },
                     Candidate {
-                        user: f[1],
+                        user,
                         ingest,
                         ts,
-                        revenue,
+                        revenue: revenue as u32,
                         category,
                     },
                 ));
-                if valid.is_some() && !users.ids.contains_key(f[1]) {
-                    p.users.insert(f[1]);
-                }
             }
-            p
+            Parsed {
+                shards,
+                users: names,
+            }
         })
         .collect();
     eprintln!("parse events {:.3}s", clock.elapsed().as_secs_f64());
-    let mut parsed_clicks: Vec<(Vec<ClickInput>, Set<&[u8]>)> = chunks(&click_files)
+    let parsed_clicks: Vec<(Vec<ClickInput>, Vec<&[u8]>)> = chunks(&click_files)
         .into_par_iter()
         .map(|chunk| {
             let mut list = Vec::new();
-            let mut ids = Set::new();
-            for row in chunk.split(|&b| b == b'\n') {
+            let mut ids = Vec::new();
+            let mut local = Map::new();
+            for row in lines(chunk) {
                 let Some(f) = fields::<4>(row) else {
                     continue;
                 };
@@ -584,24 +678,21 @@ fn main() {
                 list.push(ClickInput {
                     ts,
                     id: f[0],
-                    user: f[1],
+                    user: intern_local(f[1], &users.ids, &mut local, &mut ids, known_count),
                     campaign,
                 });
-                if !users.ids.contains_key(f[1]) {
-                    ids.insert(f[1]);
-                }
             }
             (list, ids)
         })
         .collect();
     eprintln!("parse clicks {:.3}s", clock.elapsed().as_secs_f64());
     let missing = parsed
-        .par_iter_mut()
-        .map(|p| std::mem::take(&mut p.users))
+        .par_iter()
+        .map(|p| p.users.iter().copied().collect::<Set<_>>())
         .chain(
             parsed_clicks
-                .par_iter_mut()
-                .map(|(_, ids)| std::mem::take(ids)),
+                .par_iter()
+                .map(|(_, ids)| ids.iter().copied().collect::<Set<_>>()),
         )
         .reduce(Set::new, |mut a, mut b| {
             if a.len() < b.len() {
@@ -615,24 +706,50 @@ fn main() {
         users.add(user);
     }
     users.finish();
+    parsed.par_iter_mut().for_each(|p| {
+        let mapping: Vec<u32> = p.users.iter().map(|id| users.ids[id]).collect();
+        for part in &mut p.shards {
+            for (_, candidate) in part {
+                if candidate.ts != i64::MIN {
+                    candidate.user = remap(candidate.user, known_count, &mapping);
+                }
+            }
+        }
+    });
     eprintln!("intern users {:.3}s", clock.elapsed().as_secs_f64());
-    let mut raw_shards: Vec<Vec<Vec<Raw>>> = (0..SHARDS).map(|_| Vec::new()).collect();
+    let mut raw_shards: Vec<Vec<Vec<Raw>>> = (0..shard_count).map(|_| Vec::new()).collect();
     for p in parsed {
         for (out, part) in raw_shards.iter_mut().zip(p.shards) {
             out.push(part);
         }
     }
+    let mut clicks: Vec<Click> = parsed_clicks
+        .into_par_iter()
+        .flat_map_iter(|(v, missing)| {
+            let mapping: Vec<u32> = missing.iter().map(|id| users.ids[id]).collect();
+            v.into_iter().map(move |c| Click {
+                ts: c.ts,
+                id: c.id,
+                user: remap(c.user, known_count, &mapping),
+                campaign: c.campaign,
+            })
+        })
+        .collect();
+    let user_names = &users.names;
     eprintln!(
         "parse+identity {:.3}s; {} raw events, {} IDs",
         clock.elapsed().as_secs_f64(),
         raw_shards.iter().flatten().map(Vec::len).sum::<usize>(),
-        users.names.len()
+        user_names.len()
     );
     let event_parts: Vec<Vec<Event>> = raw_shards
         .into_par_iter()
         .map(|raw| {
-            let mut keep: Map<&[u8], Candidate> =
-                Map::with_capacity(raw.iter().map(Vec::len).sum());
+            let mut keep: HashMap<EventKey, Candidate, BuildHasherDefault<CachedHasher>> =
+                HashMap::with_capacity_and_hasher(
+                    raw.iter().map(Vec::len).sum(),
+                    Default::default(),
+                );
             for (id, candidate) in raw.into_iter().flatten() {
                 let entry = keep.entry(id).or_insert(candidate);
                 if candidate.ingest < entry.ingest {
@@ -645,9 +762,9 @@ fn main() {
                     continue;
                 }
                 events.push(Event {
-                    ts: candidate.ts,
+                    ts: (candidate.ts - window_start) as u32,
                     revenue: candidate.revenue,
-                    user: users.ids[candidate.user],
+                    user: candidate.user,
                     category: candidate.category,
                 });
             }
@@ -658,17 +775,6 @@ fn main() {
     for mut part in event_parts {
         events.append(&mut part);
     }
-    let mut clicks: Vec<Click> = parsed_clicks
-        .into_par_iter()
-        .flat_map_iter(|(v, _)| {
-            v.into_iter().map(|c| Click {
-                ts: c.ts,
-                id: c.id,
-                user: users.ids[c.user],
-                campaign: c.campaign,
-            })
-        })
-        .collect();
     eprintln!(
         "dedup+validate {:.3}s; {} events, {} clicks",
         clock.elapsed().as_secs_f64(),
@@ -688,7 +794,7 @@ fn main() {
             clicks.dedup_by(|a, b| a.id == b.id);
         },
     );
-    let mut click_offsets = vec![0; users.names.len() + 1];
+    let mut click_offsets = vec![0; user_names.len() + 1];
     for c in &clicks {
         click_offsets[c.user as usize + 1] += 1;
     }
@@ -712,7 +818,7 @@ fn main() {
     );
     let batches: Vec<Results> = spans
         .par_chunks(4096)
-        .map(|p| process_people(p, &events, &clicks, &click_offsets))
+        .map(|p| process_people(p, &events, &clicks, &click_offsets, window_start))
         .collect();
     let mut results = Results::default();
     for mut batch in batches {
@@ -744,7 +850,7 @@ fn main() {
         &output.join("user_daily"), &format!("part-{index:05}.parquet"),
         "message user_daily { REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BYTE_ARRAY top_category (UTF8); }",
         vec![
-            str_col(part.iter().map(|u| users.names[u.user as usize])),
+            str_col(part.iter().map(|u| user_names[u.user as usize])),
             Col::Dates(part.iter().map(|u| u.day).collect()),
             Col::Ints(part.iter().map(|u| u.sessions).collect()),
             Col::Ints(part.iter().map(|u| u.events).collect()),
@@ -777,4 +883,75 @@ fn main() {
     // All files are closed and committed above. Avoid walking large temporary
     // allocations and unmapping read-only inputs just before process termination.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_hash_collisions_preserve_distinct_event_ids() {
+        let mut map: HashMap<EventKey, i32, BuildHasherDefault<CachedHasher>> = HashMap::default();
+        map.insert(
+            EventKey {
+                hash: 7,
+                bytes: b"e1",
+            },
+            10,
+        );
+        map.insert(
+            EventKey {
+                hash: 7,
+                bytes: b"e1 ",
+            },
+            20,
+        );
+        map.insert(
+            EventKey {
+                hash: 7,
+                bytes: b"E1",
+            },
+            30,
+        );
+        map.insert(
+            EventKey {
+                hash: 7,
+                bytes: b"e1\r",
+            },
+            40,
+        );
+        let same_id_in_another_buffer = b"e1".to_vec();
+        assert_eq!(
+            map.insert(
+                EventKey {
+                    hash: 7,
+                    bytes: &same_id_in_another_buffer
+                },
+                50
+            ),
+            Some(10)
+        );
+        assert_eq!(map.len(), 4);
+        assert_eq!(
+            map[&EventKey {
+                hash: 7,
+                bytes: b"e1 "
+            }],
+            20
+        );
+        assert_eq!(
+            map[&EventKey {
+                hash: 7,
+                bytes: b"E1"
+            }],
+            30
+        );
+        assert_eq!(
+            map[&EventKey {
+                hash: 7,
+                bytes: b"e1\r"
+            }],
+            40
+        );
+    }
 }
