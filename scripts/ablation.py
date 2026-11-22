@@ -2,7 +2,7 @@
 """Run parser ablation rungs in fresh containers on prepared ssdata20.
 
 The benchmark image must include /app/scan-floor built with Cargo feature bench.
-Usage: ablation.py IMAGE [r0 r1 ... r8 r3fast r6scalar r7scalar r8scalar]
+Usage: ablation.py IMAGE [r0 r0lines r1 ... r8 r3fast r6scalar r7scalar r8scalar]
 """
 import subprocess
 import sys
@@ -10,7 +10,7 @@ import sys
 
 def main():
     image = sys.argv[1]
-    allowed = [f"r{i}" for i in range(9)] + ["r3fast", "r6scalar", "r7scalar", "r8scalar"]
+    allowed = [f"r{i}" for i in range(9)] + ["r0lines", "r3fast", "r6scalar", "r7scalar", "r8scalar"]
     rungs = sys.argv[2:] or ["r0", "r1", "r2", "r3", "r3fast", "r4", "r5", "r6", "r7", "r8"]
     if any(rung not in allowed for rung in rungs):
         raise ValueError("unknown ablation rung")

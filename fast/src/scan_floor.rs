@@ -56,6 +56,18 @@ mod engine {
             .par_iter()
             .map(|chunk| {
                 if LEVEL == 0 {
+                    if FAST {
+                        let (mut rows, mut checksum) = (0, 0u64);
+                        for row in lines(chunk) {
+                            rows += 1;
+                            checksum = checksum.wrapping_add(row.len() as u64);
+                        }
+                        return BenchPart {
+                            rows,
+                            checksum,
+                            buffers: Vec::new(),
+                        };
+                    }
                     return BenchPart {
                         rows: memchr::memchr_iter(b'\n', chunk).count() as u64,
                         checksum: 0,
@@ -220,11 +232,18 @@ mod engine {
             .fold(0u64, |sum, part| sum.wrapping_add(part.checksum));
         profile.mark(&format!(
             "r{LEVEL}{}{}",
-            if FAST { "fast" } else { "" },
+            if FAST && LEVEL == 0 {
+                "lines"
+            } else if FAST {
+                "fast"
+            } else {
+                ""
+            },
             if BATCH { "" } else { "scalar" }
         ));
         println!(
-            "rung={LEVEL} fast_ingest={FAST} batch={BATCH} rows={rows} checksum={checksum} candidate_bytes={} raw_bytes={} seconds={:.6}",
+            "rung={LEVEL} fast_ingest={} batch={BATCH} rows={rows} checksum={checksum} candidate_bytes={} raw_bytes={} seconds={:.6}",
+            FAST && LEVEL >= 3,
             std::mem::size_of::<Candidate>(),
             std::mem::size_of::<Raw>(),
             started.elapsed().as_secs_f64()
@@ -317,6 +336,7 @@ mod engine {
             }
             match mode {
                 "r0" => run!(0, false),
+                "r0lines" => run!(0, true),
                 "r1" => run!(1, false),
                 "r2" => run!(2, false),
                 "r3" => run!(3, false),
