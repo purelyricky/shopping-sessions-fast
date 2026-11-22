@@ -15,6 +15,9 @@ use std::{
     time::Instant,
 };
 
+#[path = "profiling.rs"]
+mod profiling;
+
 #[derive(Clone, Copy)]
 struct EventKey<'a> {
     hash: u64,
@@ -522,6 +525,7 @@ fn main() {
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(8);
+    let mut profile = profiling::Profiler::new(threads);
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
@@ -571,6 +575,7 @@ fn main() {
     users.finish();
     let known_count = users.names.len() as u32;
     eprintln!("dimensions+links {:.3}s", clock.elapsed().as_secs_f64());
+    profile.mark("dimensions_links");
     let event_files: Vec<_> = csv_files(&data.join("events"))
         .iter()
         .map(|p| map_file(p))
@@ -589,6 +594,7 @@ fn main() {
     let mut parsed: Vec<Parsed> = chunks(&event_files)
         .into_par_iter()
         .map(|chunk| {
+            let job = profile.start_job();
             let mut shards: Vec<Vec<Raw>> = (0..shard_count).map(|_| Vec::new()).collect();
             let mut names = Vec::new();
             let mut local = Map::new();
@@ -646,13 +652,17 @@ fn main() {
                     },
                 ));
             }
-            Parsed {
+            let result = Parsed {
                 shards,
                 users: names,
-            }
+            };
+            profile.finish_job(job, chunk.len());
+            result
         })
         .collect();
     eprintln!("parse events {:.3}s", clock.elapsed().as_secs_f64());
+    profile.report_parse();
+    profile.mark("event_parse");
     let parsed_clicks: Vec<(Vec<ClickInput>, Vec<&[u8]>)> = chunks(&click_files)
         .into_par_iter()
         .map(|chunk| {
@@ -686,6 +696,7 @@ fn main() {
         })
         .collect();
     eprintln!("parse clicks {:.3}s", clock.elapsed().as_secs_f64());
+    profile.mark("click_parse");
     let missing = parsed
         .par_iter()
         .map(|p| p.users.iter().copied().collect::<Set<_>>())
@@ -717,6 +728,7 @@ fn main() {
         }
     });
     eprintln!("intern users {:.3}s", clock.elapsed().as_secs_f64());
+    profile.mark("missing_id_resolution");
     let mut raw_shards: Vec<Vec<Vec<Raw>>> = (0..shard_count).map(|_| Vec::new()).collect();
     for p in parsed {
         for (out, part) in raw_shards.iter_mut().zip(p.shards) {
@@ -736,6 +748,7 @@ fn main() {
         })
         .collect();
     let user_names = &users.names;
+    profile.mark("transpose_click_ids");
     eprintln!(
         "parse+identity {:.3}s; {} raw events, {} IDs",
         clock.elapsed().as_secs_f64(),
@@ -771,10 +784,12 @@ fn main() {
             events
         })
         .collect();
+    profile.mark("event_dedup");
     let mut events = Vec::with_capacity(event_parts.iter().map(Vec::len).sum());
     for mut part in event_parts {
         events.append(&mut part);
     }
+    profile.mark("event_concat");
     eprintln!(
         "dedup+validate {:.3}s; {} events, {} clicks",
         clock.elapsed().as_secs_f64(),
@@ -794,6 +809,7 @@ fn main() {
             clicks.dedup_by(|a, b| a.id == b.id);
         },
     );
+    profile.mark("event_click_sort");
     let mut click_offsets = vec![0; user_names.len() + 1];
     for c in &clicks {
         click_offsets[c.user as usize + 1] += 1;
@@ -816,10 +832,12 @@ fn main() {
         clock.elapsed().as_secs_f64(),
         spans.len()
     );
+    profile.mark("offsets_people_ranges");
     let batches: Vec<Results> = spans
         .par_chunks(4096)
         .map(|p| process_people(p, &events, &clicks, &click_offsets, window_start))
         .collect();
+    profile.mark("session_aggregate");
     let mut results = Results::default();
     for mut batch in batches {
         results.users.append(&mut batch.users);
@@ -831,6 +849,7 @@ fn main() {
             m.assists += v.assists;
         }
     }
+    profile.mark("merge_results");
     let us = &results.users;
     let parts: Vec<&[UserRow]> = if us.is_empty() {
         vec![us]
@@ -859,6 +878,7 @@ fn main() {
         ],
         );
     });
+    profile.mark("write_user_parquet");
     let cs: Vec<_> = results.campaigns.into_iter().collect();
     write_table(
         &output.join("campaign_daily"),
@@ -874,6 +894,7 @@ fn main() {
             Col::Ints(cs.iter().map(|(_, m)| m.assists).collect()),
         ],
     );
+    profile.mark("write_campaign_parquet");
     eprintln!(
         "finished {:.3}s; {} user/day rows, {} campaign/day rows",
         clock.elapsed().as_secs_f64(),
