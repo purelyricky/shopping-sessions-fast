@@ -18,7 +18,27 @@ mod engine {
         buffers: Vec<Vec<Raw<'a>>>,
     }
 
-    fn rung<'a, const LEVEL: u8, const FAST: bool>(
+    fn bench_flush<'a, const LEVEL: u8>(
+        batch: &[PendingEvent<'a>],
+        result: &mut BenchPart<'a>,
+        users: &Users<'a>,
+        local: &mut Map<Bytes<'a>, u32>,
+        unknown: &UnknownUsers<'a>,
+        shard_count: usize,
+    ) {
+        let resolved = resolve_batch(batch, |row| row.user, users, local, unknown);
+        for (row, &user) in batch.iter().zip(&resolved) {
+            result.checksum = result.checksum.wrapping_add(u64::from(user));
+            if LEVEL >= 7 {
+                let mut candidate = row.value;
+                candidate.user = user;
+                result.buffers[row.key.hash as usize & (shard_count - 1)]
+                    .push((row.key, candidate));
+            }
+        }
+    }
+
+    fn rung<'a, const LEVEL: u8, const FAST: bool, const BATCH: bool>(
         jobs: &[&'a [u8]],
         users: &Users<'a>,
         products: &Map<&'a [u8], u32>,
@@ -52,6 +72,24 @@ mod engine {
                     },
                 };
                 let mut local = Map::new();
+                let mut batch = [PendingEvent {
+                    user: PendingUser {
+                        bytes: b"",
+                        hash: 0,
+                    },
+                    key: EventKey {
+                        bytes: b"",
+                        hash: 0,
+                    },
+                    value: Candidate {
+                        ingest: 0,
+                        user: 0,
+                        ts: u32::MAX,
+                        revenue: 0,
+                        category: 0,
+                    },
+                }; 16];
+                let mut batch_len = 0;
                 for row in lines(chunk) {
                     let Some(f) = fields::<7>(row) else {
                         continue;
@@ -106,12 +144,12 @@ mod engine {
                             .wrapping_add(revenue as u64)
                             .wrapping_add(u64::from(valid));
                     }
-                    let user = if LEVEL >= 6 && valid {
+                    let user = if LEVEL >= 6 && !BATCH && valid {
                         intern_local(f[1], users, &mut local, &unknown)
                     } else {
                         0
                     };
-                    if LEVEL >= 6 {
+                    if LEVEL >= 6 && !BATCH {
                         result.checksum = result.checksum.wrapping_add(u64::from(user));
                     }
                     let category = if LEVEL >= 8 && valid && revenue > 0 {
@@ -122,7 +160,7 @@ mod engine {
                     if LEVEL >= 8 {
                         result.checksum = result.checksum.wrapping_add(u64::from(category));
                     }
-                    if LEVEL >= 7 {
+                    if LEVEL >= 7 || (LEVEL >= 6 && BATCH) {
                         let candidate = Candidate {
                             ingest,
                             user,
@@ -134,14 +172,43 @@ mod engine {
                             revenue: revenue as u32,
                             category,
                         };
-                        result.buffers[event_hash as usize & (shard_count - 1)].push((
-                            EventKey {
-                                hash: event_hash,
-                                bytes: f[0],
-                            },
-                            candidate,
-                        ));
+                        let key = EventKey {
+                            hash: event_hash,
+                            bytes: f[0],
+                        };
+                        if BATCH {
+                            batch[batch_len] = PendingEvent {
+                                user: PendingUser::new(if valid { f[1] } else { b"" }, users),
+                                key,
+                                value: candidate,
+                            };
+                            batch_len += 1;
+                            if batch_len == batch.len() {
+                                bench_flush::<LEVEL>(
+                                    &batch,
+                                    &mut result,
+                                    users,
+                                    &mut local,
+                                    &unknown,
+                                    shard_count,
+                                );
+                                batch_len = 0;
+                            }
+                        } else {
+                            result.buffers[event_hash as usize & (shard_count - 1)]
+                                .push((key, candidate));
+                        }
                     }
+                }
+                if LEVEL >= 6 && BATCH {
+                    bench_flush::<LEVEL>(
+                        &batch[..batch_len],
+                        &mut result,
+                        users,
+                        &mut local,
+                        &unknown,
+                        shard_count,
+                    );
                 }
                 result
             })
@@ -151,13 +218,33 @@ mod engine {
         let checksum = parts
             .iter()
             .fold(0u64, |sum, part| sum.wrapping_add(part.checksum));
-        profile.mark(&format!("r{LEVEL}{}", if FAST { "fast" } else { "" }));
+        profile.mark(&format!(
+            "r{LEVEL}{}{}",
+            if FAST { "fast" } else { "" },
+            if BATCH { "" } else { "scalar" }
+        ));
         println!(
-            "rung={LEVEL} fast_ingest={FAST} rows={rows} checksum={checksum} candidate_bytes={} raw_bytes={} seconds={:.6}",
+            "rung={LEVEL} fast_ingest={FAST} batch={BATCH} rows={rows} checksum={checksum} candidate_bytes={} raw_bytes={} seconds={:.6}",
             std::mem::size_of::<Candidate>(),
             std::mem::size_of::<Raw>(),
             started.elapsed().as_secs_f64()
         );
+        if LEVEL >= 7 {
+            let retained: usize = parts
+                .iter()
+                .flat_map(|part| &part.buffers)
+                .map(Vec::len)
+                .sum();
+            let capacity: usize = parts
+                .iter()
+                .flat_map(|part| &part.buffers)
+                .map(Vec::capacity)
+                .sum();
+            println!(
+                "retained_rows={retained} capacity_rows={capacity} capacity_bytes={}",
+                capacity * std::mem::size_of::<Raw>()
+            );
+        }
     }
 
     pub fn probe() {
@@ -213,7 +300,10 @@ mod engine {
             );
             macro_rules! run {
                 ($n:literal,$fast:literal) => {
-                    rung::<$n, $fast>(
+                    run!($n, $fast, true)
+                };
+                ($n:literal,$fast:literal,$batch:literal) => {
+                    rung::<$n, $fast, $batch>(
                         &jobs,
                         &users,
                         &products,
@@ -236,6 +326,9 @@ mod engine {
                 "r6" => run!(6, false),
                 "r7" => run!(7, false),
                 "r8" => run!(8, false),
+                "r6scalar" => run!(6, false, false),
+                "r7scalar" => run!(7, false, false),
+                "r8scalar" => run!(8, false, false),
                 _ => panic!("unknown rung"),
             };
             std::process::exit(0);
