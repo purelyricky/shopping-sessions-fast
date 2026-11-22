@@ -1,0 +1,22 @@
+[package]
+name = "shopping-sessions-fast"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "shopping-sessions"
+path = "src/main.rs"
+
+[dependencies]
+ahash = "0.8"
+memmap2 = "0.9"
+parquet = { version = "57", default-features = false }
+rayon = "1.11"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
