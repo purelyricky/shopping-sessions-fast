@@ -54,8 +54,7 @@ unsafe fn vector_fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
         }
         true
     };
-    // Every vector load is either within row or within an initialized local
-    // tail. Padding bytes are zero, so cannot add comma or quote matches.
+    // Every vector load is within row or an initialized short-row local copy.
     unsafe {
         let commas = _mm256_set1_epi8(b',' as i8);
         let quote = _mm256_set1_epi8(b'"' as i8);
@@ -72,12 +71,23 @@ unsafe fn vector_fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
         }
         if offset < row.len() {
             let mut tail = [0u8; 32];
-            tail[..row.len() - offset].copy_from_slice(&row[offset..]);
-            let bytes = _mm256_loadu_si256(tail.as_ptr().cast());
-            let cm = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, commas)) as u32;
-            let qm = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote)) as u32;
+            let (bytes, base, keep) = if row.len() >= 32 {
+                // Overlap the last complete vector, masking bytes that were
+                // already counted. This never reads past the row boundary.
+                let base = row.len() - 32;
+                (
+                    _mm256_loadu_si256(row.as_ptr().add(base).cast()),
+                    base,
+                    u32::MAX << (offset - base),
+                )
+            } else {
+                tail[..row.len()].copy_from_slice(row);
+                (_mm256_loadu_si256(tail.as_ptr().cast()), 0, u32::MAX)
+            };
+            let cm = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, commas)) as u32 & keep;
+            let qm = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote)) as u32 & keep;
             quotes += qm.count_ones() as usize;
-            if !append(cm, offset) {
+            if !append(cm, base) {
                 return None;
             }
         }
