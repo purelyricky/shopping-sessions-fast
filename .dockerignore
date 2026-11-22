@@ -1,0 +1,7 @@
+.git
+log.txt
+oracle
+fixtures
+scripts
+fast/target
+*.md
