@@ -9,7 +9,7 @@ Fast click-stream -> Parquet pipeline for the Databricks Shopping Sessions track
 
 ## Third-party code
 
-Rust crates: ahash, libc, memchr, memmap2, rayon, serde_json, parquet (arrow-rs). Base images: `rust:1-slim-bookworm` (build), `debian:bookworm-slim` (run). Oracle/test scripts use Python, pyarrow, polars, duckdb (not shipped in the image). Fixtures, `compare.py`, `run_fixtures.py` and the data generator come from the organizers' kit.
+Rust crates: ahash, libc, memchr, memmap2, mimalloc, rayon, radsort, serde_json, parquet (arrow-rs). Base images: `rust:1-slim-bookworm` (build), `debian:bookworm-slim` (run). Oracle/test scripts use Python, pyarrow, polars, duckdb (not shipped in the image). Fixtures, `compare.py`, `run_fixtures.py` and the data generator come from the organizers' kit.
 
 ## Approach
 

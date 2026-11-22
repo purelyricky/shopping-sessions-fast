@@ -18,6 +18,11 @@ use std::{
     time::Instant,
 };
 
+#[path = "person_sort.rs"]
+mod person_sort;
+
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[path = "profiling.rs"]
 mod profiling;
 
@@ -219,27 +224,47 @@ fn chunks(maps: &[Mmap]) -> Vec<&[u8]> {
 }
 
 struct Users<'a> {
-    ids: Map<Bytes<'a>, u32>,
+    ids: Vec<HashMap<EventKey<'a>, u32, BuildHasherDefault<CachedHasher>>>,
+    hash: RandomState,
     names: Vec<Bytes<'a>>,
     parent: Vec<u32>,
 }
 impl<'a> Users<'a> {
-    fn new() -> Self {
-        Self {
-            ids: Map::new(),
-            names: Vec::new(),
-            parent: Vec::new(),
+    fn from_links(maps: &'a [Mmap]) -> Self {
+        let interner = UnknownUsers::new(0);
+        let edges: Vec<(u32, u32)> = chunks(maps)
+            .into_par_iter()
+            .flat_map_iter(|chunk| {
+                let interner = &interner;
+                lines(chunk).filter_map(move |row| {
+                    let f = fields::<2>(row)?;
+                    if f[0].is_empty() || f[1].is_empty() {
+                        return None;
+                    }
+                    Some((interner.intern(f[0]), interner.intern(f[1])))
+                })
+            })
+            .collect();
+        let mut names = Vec::new();
+        let (ids, hash) = interner.into_dicts(&mut names);
+        let parent = (0..names.len() as u32).collect();
+        let mut users = Self {
+            ids,
+            hash,
+            names,
+            parent,
+        };
+        for (a, b) in edges {
+            users.join(a, b);
         }
+        users.finish();
+        users
     }
-    fn add(&mut self, s: Bytes<'a>) -> u32 {
-        if let Some(&id) = self.ids.get(s) {
-            return id;
-        }
-        let id = self.names.len() as u32;
-        self.ids.insert(s, id);
-        self.names.push(s);
-        self.parent.push(id);
-        id
+    fn lookup(&self, id: Bytes<'_>) -> Option<u32> {
+        let hash = self.hash.hash_one(id);
+        self.ids[hash as usize & 255]
+            .get(&EventKey { hash, bytes: id })
+            .copied()
     }
     fn root(&mut self, mut id: u32) -> u32 {
         while self.parent[id as usize] != id {
@@ -248,11 +273,9 @@ impl<'a> Users<'a> {
         }
         id
     }
-    fn join(&mut self, a: Bytes<'a>, b: Bytes<'a>) {
-        let ai = self.add(a);
-        let bi = self.add(b);
-        let mut ar = self.root(ai);
-        let mut br = self.root(bi);
+    fn join(&mut self, a: u32, b: u32) {
+        let mut ar = self.root(a);
+        let mut br = self.root(b);
         if ar == br {
             return;
         }
@@ -265,9 +288,12 @@ impl<'a> Users<'a> {
         for id in 0..self.parent.len() {
             self.parent[id] = self.root(id as u32);
         }
-        for id in self.ids.values_mut() {
-            *id = self.parent[*id as usize];
-        }
+        let parent = &self.parent;
+        self.ids.par_iter_mut().for_each(|shard| {
+            for id in shard.values_mut() {
+                *id = parent[*id as usize];
+            }
+        });
     }
 }
 
@@ -328,22 +354,35 @@ impl<'a> UnknownUsers<'a> {
             .or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed))
     }
     fn finish(self, names: &mut Vec<Bytes<'a>>) {
+        self.into_dicts(names);
+    }
+    fn into_dicts(
+        self,
+        names: &mut Vec<Bytes<'a>>,
+    ) -> (
+        Vec<HashMap<EventKey<'a>, u32, BuildHasherDefault<CachedHasher>>>,
+        RandomState,
+    ) {
         names.resize(self.next.into_inner() as usize, b"");
+        let mut shards = Vec::with_capacity(self.shards.len());
         for shard in self.shards {
-            for (key, id) in shard.into_inner().unwrap() {
+            let shard = shard.into_inner().unwrap();
+            for (key, &id) in &shard {
                 names[id as usize] = key.bytes;
             }
+            shards.push(shard);
         }
+        (shards, self.hash)
     }
 }
 
 fn intern_local<'a>(
     id: Bytes<'a>,
-    known: &Map<Bytes<'a>, u32>,
+    known: &Users<'a>,
     local: &mut Map<Bytes<'a>, u32>,
     unknown: &UnknownUsers<'a>,
 ) -> u32 {
-    if let Some(&user) = known.get(id) {
+    if let Some(user) = known.lookup(id) {
         return user;
     }
     *local.entry(id).or_insert_with(|| unknown.intern(id))
@@ -373,13 +412,14 @@ fn process_people(
     spans: &[(usize, usize)],
     events: &[Event],
     clicks: &[Click],
-    click_offsets: &[usize],
+    click_ranges: &[(usize, usize)],
     window_start: i64,
 ) -> Results {
     let mut result = Results::default();
     for &(begin, end) in spans {
         let uid = events[begin].user;
-        let user_clicks = &clicks[click_offsets[uid as usize]..click_offsets[uid as usize + 1]];
+        let (click_begin, click_end) = click_ranges[uid as usize];
+        let user_clicks = &clicks[click_begin..click_end];
         let (mut left, mut right) = (0, 0);
         let mut active: Map<u32, u32> = Map::new();
         let mut day = i32::MIN;
@@ -585,15 +625,7 @@ fn main() {
         .iter()
         .map(|p| map_file(p))
         .collect();
-    let mut users = Users::new();
-    for link in &links {
-        for f in records(link).filter_map(fields::<2>) {
-            if !f[0].is_empty() && !f[1].is_empty() {
-                users.join(f[0], f[1]);
-            }
-        }
-    }
-    users.finish();
+    let mut users = Users::from_links(&links);
     let known_count = users.names.len() as u32;
     let unknown_users = UnknownUsers::new(known_count);
     eprintln!("dimensions+links {:.3}s", clock.elapsed().as_secs_f64());
@@ -654,7 +686,7 @@ fn main() {
                 })();
                 let (ts, revenue, category) = valid.unwrap_or((i64::MIN, 0, unknown));
                 let user = if valid.is_some() {
-                    intern_local(f[1], &users.ids, &mut local, &unknown_users)
+                    intern_local(f[1], &users, &mut local, &unknown_users)
                 } else {
                     0
                 };
@@ -705,7 +737,7 @@ fn main() {
                 list.push(ClickInput {
                     ts,
                     id: f[0],
-                    user: intern_local(f[1], &users.ids, &mut local, &unknown_users),
+                    user: intern_local(f[1], &users, &mut local, &unknown_users),
                     campaign,
                 });
             }
@@ -723,15 +755,17 @@ fn main() {
             out.push(part);
         }
     }
-    let mut clicks: Vec<Click> = parsed_clicks
+    let click_parts: Vec<Vec<Click>> = parsed_clicks
         .into_par_iter()
-        .flat_map_iter(|v| {
-            v.into_iter().map(move |c| Click {
-                ts: c.ts,
-                id: c.id,
-                user: c.user,
-                campaign: c.campaign,
-            })
+        .map(|v| {
+            v.into_iter()
+                .map(move |c| Click {
+                    ts: c.ts,
+                    id: c.id,
+                    user: c.user,
+                    campaign: c.campaign,
+                })
+                .collect()
         })
         .collect();
     let user_names = &users.names;
@@ -772,37 +806,33 @@ fn main() {
         })
         .collect();
     profile.mark("event_dedup");
-    let mut events = Vec::with_capacity(event_parts.iter().map(Vec::len).sum());
-    for mut part in event_parts {
-        events.append(&mut part);
-    }
-    profile.mark("event_concat");
     eprintln!(
         "dedup+validate {:.3}s; {} events, {} clicks",
         clock.elapsed().as_secs_f64(),
-        events.len(),
-        clicks.len()
+        event_parts.iter().map(Vec::len).sum::<usize>(),
+        click_parts.iter().map(Vec::len).sum::<usize>()
     );
-    rayon::join(
-        || events.par_sort_unstable_by_key(|e| (e.user, e.ts)),
+    let (events, clicks) = rayon::join(
+        || person_sort::events(event_parts),
         || {
-            // At a tied timestamp the smallest click ID is last, for last-click credit.
-            clicks.par_sort_unstable_by(|a, b| {
-                a.user
-                    .cmp(&b.user)
-                    .then(a.ts.cmp(&b.ts))
-                    .then_with(|| b.id.cmp(a.id))
-            });
-            clicks.dedup_by(|a, b| a.id == b.id);
+            person_sort::clicks(
+                click_parts,
+                window_start - WEEK,
+                window_end - window_start + WEEK,
+            )
         },
     );
     profile.mark("event_click_sort");
-    let mut click_offsets = vec![0; user_names.len() + 1];
-    for c in &clicks {
-        click_offsets[c.user as usize + 1] += 1;
-    }
-    for i in 1..click_offsets.len() {
-        click_offsets[i] += click_offsets[i - 1];
+    let mut click_ranges = vec![(0usize, 0usize); user_names.len()];
+    let mut click_at = 0;
+    while click_at < clicks.len() {
+        let begin = click_at;
+        let user = clicks[begin].user;
+        click_at += 1;
+        while click_at < clicks.len() && clicks[click_at].user == user {
+            click_at += 1;
+        }
+        click_ranges[user as usize] = (begin, click_at);
     }
     let mut spans = Vec::new();
     let mut at = 0;
@@ -822,7 +852,7 @@ fn main() {
     profile.mark("offsets_people_ranges");
     let batches: Vec<Results> = spans
         .par_chunks(4096)
-        .map(|p| process_people(p, &events, &clicks, &click_offsets, window_start))
+        .map(|p| process_people(p, &events, &clicks, &click_ranges, window_start))
         .collect();
     profile.mark("session_aggregate");
     let mut results = Results::default();
