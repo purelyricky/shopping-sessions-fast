@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 ahash = "0.8"
 memmap2 = "0.9"
+memchr = "2"
 parquet = { version = "57", default-features = false }
 rayon = "1.11"
 serde_json = "1"
